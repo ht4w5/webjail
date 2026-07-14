@@ -57,15 +57,26 @@ type SeekInfo struct {
 	Whence int
 }
 
+type tailState int8
+
+const (
+	stateInit tailState = iota
+	stateReady
+	stateEOF
+	stateNotOpen
+	stateFailed
+)
+
 type Tail struct {
 	cfg      Config
 	filename string
-	file     *os.File
-	watcher  Watcher
 
-	reader *bufio.Reader
+	file    *os.File
+	watcher Watcher
+	reader  *bufio.Reader
 
-	firstOpen bool
+	state   tailState
+	failErr error
 
 	mu     sync.Mutex
 	ctx    context.Context
@@ -73,6 +84,9 @@ type Tail struct {
 }
 
 func New(ctx context.Context, filename string, cfg Config) (*Tail, error) {
+	if !cfg.Follow && cfg.Retry {
+		return nil, errors.New("Retry set without Follow")
+	}
 
 	var watcher Watcher
 	var err error
@@ -95,160 +109,191 @@ func newTailWithWatcher(ctx context.Context, filename string, cfg Config, watche
 	ctx, cancel := context.WithCancel(ctx)
 
 	return &Tail{
-		cfg:       cfg,
-		filename:  filename,
-		watcher:   watcher,
-		reader:    bufio.NewReader(&fakeReader{}),
-		firstOpen: true,
-		ctx:       ctx,
-		cancel:    cancel,
+		cfg:      cfg,
+		filename: filename,
+		watcher:  watcher,
+		reader:   bufio.NewReader(&fakeReader{}),
+		state:    stateInit,
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 }
 
 var (
 	ErrBufferTooShort = errors.New("buffer is too short to read complete line")
+	ErrClosed         = errors.New("closed")
 )
 
-func (t *Tail) ReadLine(b []byte) (n int, err error) {
+func (t *Tail) ReadLine(b []byte) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	for {
-		// Try to read a complete line already in the buffer
-		if t.file != nil {
-			n, found, err := t.tryReadLine(b)
-			if found || err != nil {
-				return n, err
+		switch t.state {
+		case stateInit:
+			// Try to open file
+			file, err := os.Open(t.filename)
+			if err != nil {
+				t.failErr = err
+				t.state = stateNotOpen
+				continue
+			} else {
+				if !t.cfg.NoSeek {
+					_, err = file.Seek(t.cfg.Seek.Offset, t.cfg.Seek.Whence)
+					if err != nil {
+						t.failErr = err
+						t.state = stateFailed
+						return 0, err
+					}
+				}
+				t.file = file
+				t.reader.Reset(file)
+				t.state = stateReady
+				continue
 			}
-			// No complete line in buffer
+
+		case stateReady:
+			// Try to read line
+			n := t.reader.Buffered()
+			if n == 0 {
+				if _, err := t.reader.Peek(1); err != nil {
+					if errors.Is(err, io.EOF) {
+						t.state = stateEOF
+						continue
+					} else {
+						t.failErr = err
+						t.state = stateFailed
+						return 0, err
+					}
+				}
+				n = t.reader.Buffered()
+			}
+
+			peeked, err := t.reader.Peek(n)
+			if err != nil && !errors.Is(err, io.EOF) {
+				t.failErr = err
+				t.state = stateFailed
+				return 0, err
+			}
+
+			idx := bytes.IndexByte(peeked, t.cfg.Delimiter)
+			if idx < 0 {
+				// Not a full line
+				t.state = stateEOF
+				continue
+			}
+
+			if len(b) < idx {
+				return 0, ErrBufferTooShort
+			}
+
+			copied := copy(b, peeked[:idx])
+			t.reader.Discard(idx + 1)
+			return copied, nil
+
+		case stateEOF:
 			if !t.cfg.Follow {
+				t.failErr = io.EOF
+				t.state = stateFailed
 				return 0, io.EOF
 			}
-		}
 
-		// Eagerly open file
-		if t.file == nil && !t.cfg.Follow {
-			if err := t.openFile(); err == nil {
-				continue
-			}
-		}
-
-		// Wait for next file change
-		ch, bErr := t.watcher.BlockUntilChange(t.ctx)
-		if bErr != nil {
-			return 0, bErr
-		}
-
-		fileWasOpen := t.file != nil
-
-		if t.file == nil {
-			if ch != ChangeDeleted {
-				err = t.openFile()
-				if err != nil {
-					if t.cfg.Retry && t.cfg.Follow {
-						continue
-					}
-					return
-				}
-			} else {
-				continue
-			}
-		}
-
-		switch ch {
-		case ChangeCreated:
-			if fileWasOpen {
-				err = t.reopenFile()
-				if err != nil {
-					return
-				}
-			}
-		case ChangeDeleted:
-			err = t.closeFile()
+			ch, err := t.watcher.BlockUntilChange(t.ctx)
 			if err != nil {
-				return
+				t.failErr = err
+				t.state = stateFailed
+				return 0, err
 			}
-		case ChangeModified:
-			t.reader.Reset(t.file)
-		case ChangeTruncated:
-			if !t.cfg.NoSeek {
-				_, err = t.file.Seek(0, io.SeekStart)
+
+			switch ch {
+			case ChangeModified:
+				t.state = stateReady
+				continue
+			case ChangeDeleted:
+				err = t.file.Close()
 				if err != nil {
-					return
+					t.failErr = err
+					t.state = stateFailed
+					return 0, err
 				}
+				t.state = stateNotOpen
+				continue
+			case ChangeCreated:
+				t.state = stateReady
+				continue
+			case ChangeTruncated:
+				if !t.cfg.NoSeek {
+					_, err := t.file.Seek(0, io.SeekStart)
+					if err != nil {
+						t.failErr = err
+						t.state = stateFailed
+						return 0, err
+					}
+				}
+				t.reader.Reset(t.file)
+				t.state = stateReady
+				continue
 			}
+
+		case stateNotOpen:
+			if !t.cfg.Retry {
+				t.state = stateFailed
+				return 0, errors.New("cannot open file")
+			}
+
+			ch, err := t.watcher.BlockUntilChange(t.ctx)
+			if err != nil {
+				t.failErr = err
+				t.state = stateFailed
+				return 0, err
+			}
+
+			switch ch {
+			case ChangeCreated:
+				// Try to open file
+				file, err := os.Open(t.filename)
+				if err != nil {
+					continue
+				} else {
+					t.file = file
+					t.reader.Reset(file)
+					t.state = stateReady
+					continue
+				}
+
+			case ChangeDeleted:
+				t.failErr = errors.New("got ChangeDeleted in stateNotOpen")
+				t.state = stateFailed
+				return 0, t.failErr
+
+			case ChangeModified:
+				t.failErr = errors.New("got ChangeModified in stateNotOpen")
+				t.state = stateFailed
+				return 0, t.failErr
+
+			case ChangeTruncated:
+				t.failErr = errors.New("got ChangeModified in stateNotOpen")
+				t.state = stateFailed
+				return 0, t.failErr
+			}
+
+		case stateFailed:
+			return 0, t.failErr
 		}
 	}
-}
-
-func (t *Tail) tryReadLine(b []byte) (n int, found bool, err error) {
-	nBuf := t.reader.Buffered()
-	if nBuf == 0 {
-		if _, err := t.reader.Peek(1); err != nil {
-			if errors.Is(err, io.EOF) {
-				return 0, false, nil
-			}
-			return 0, false, err
-		}
-		nBuf = t.reader.Buffered()
-	}
-
-	peeked, err := t.reader.Peek(nBuf)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return 0, false, err
-	}
-
-	idx := bytes.IndexByte(peeked, t.cfg.Delimiter)
-	if idx < 0 {
-		return 0, false, nil
-	}
-
-	if len(b) < idx {
-		return 0, false, ErrBufferTooShort
-	}
-
-	copied := copy(b, peeked[:idx])
-	t.reader.Discard(idx + 1)
-	return copied, true, nil
 }
 
 func (t *Tail) Close() error {
 	t.cancel()
-	return t.closeFile()
-}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-func (t *Tail) closeFile() (err error) {
+	t.failErr = ErrClosed
+	t.state = stateFailed
 	if t.file != nil {
-		err = t.file.Close()
-		t.file = nil
-	}
-	return
-}
-
-func (t *Tail) openFile() error {
-	file, err := os.Open(t.filename)
-	if err != nil {
-		return err
-	}
-
-	if !t.cfg.NoSeek && t.firstOpen {
-		if _, err := file.Seek(t.cfg.Seek.Offset, t.cfg.Seek.Whence); err != nil {
-			file.Close()
+		if err := t.file.Close(); err != nil {
 			return err
 		}
 	}
-	t.firstOpen = false
-
-	t.file = file
-	t.reader.Reset(t.file)
 	return nil
-}
-
-func (t *Tail) reopenFile() (err error) {
-	err = t.closeFile()
-	if err != nil {
-		return
-	}
-	err = t.openFile()
-	return
 }

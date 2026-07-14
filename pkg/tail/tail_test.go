@@ -147,19 +147,13 @@ func TestTail_SeekToEnd_Follow(t *testing.T) {
 
 	buf := make([]byte, 1024)
 
-	// Start ReadLine — it blocks waiting for file to appear.
+	// Start ReadLine — it blocks after seeking to end of file.
 	wait := startReadLine(t, tail, buf)
 
 	time.Sleep(50 * time.Millisecond)
 
-	// 1) Let Tail open the file (seeking to end).
-	fw.send(ChangeCreated)
-	time.Sleep(50 * time.Millisecond)
-
-	// 2) Append new data.
+	// Append new data and notify.
 	appendFile(t, path, []byte("new_line\n"))
-
-	// 3) Notify of modification.
 	fw.send(ChangeModified)
 
 	n, err := wait()
@@ -223,6 +217,7 @@ func TestTail_FileDeletedWhileFollowing(t *testing.T) {
 
 	cfg := Config{
 		Follow:    true,
+		Retry:     true,
 		Delimiter: '\n',
 	}
 	tail := newTailWithWatcher(context.Background(), path, cfg, fw)
@@ -231,11 +226,7 @@ func TestTail_FileDeletedWhileFollowing(t *testing.T) {
 	buf := make([]byte, 1024)
 
 	// Initial read.
-	wait := startReadLine(t, tail, buf)
-	time.Sleep(50 * time.Millisecond)
-	fw.send(ChangeCreated)
-
-	n, err := wait()
+	n, err := tail.ReadLine(buf)
 	if err != nil {
 		t.Fatalf("first line: unexpected error: %v", err)
 	}
@@ -244,7 +235,7 @@ func TestTail_FileDeletedWhileFollowing(t *testing.T) {
 	}
 
 	// ReadLine again — blocks waiting for more data.
-	wait = startReadLine(t, tail, buf)
+	wait := startReadLine(t, tail, buf)
 	time.Sleep(50 * time.Millisecond)
 
 	// Delete the file.
@@ -366,11 +357,7 @@ func TestTail_TruncationWhileFollowing(t *testing.T) {
 	buf := make([]byte, 1024)
 
 	// Read initial line.
-	wait := startReadLine(t, tail, buf)
-	time.Sleep(50 * time.Millisecond)
-	fw.send(ChangeCreated)
-
-	n, err := wait()
+	n, err := tail.ReadLine(buf)
 	if err != nil {
 		t.Fatalf("first line: unexpected error: %v", err)
 	}
@@ -379,7 +366,7 @@ func TestTail_TruncationWhileFollowing(t *testing.T) {
 	}
 
 	// ReadLine again — blocks waiting for more data.
-	wait = startReadLine(t, tail, buf)
+	wait := startReadLine(t, tail, buf)
 	time.Sleep(50 * time.Millisecond)
 
 	// Truncate the file.
