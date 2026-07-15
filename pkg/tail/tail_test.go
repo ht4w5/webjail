@@ -1,4 +1,9 @@
 // LLM usage: generated with deepseek-v4-pro and manually modified.
+//
+// Some tests are ported from github.com/nxadm/tail:
+// Copyright (c) 2019 FOSS contributors of https://github.com/nxadm/tail
+// Copyright (c) 2015 HPE Software Inc. All rights reserved.
+// Copyright (c) 2013 ActiveState Software Inc. All rights reserved.
 package tail
 
 import (
@@ -7,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -322,8 +328,8 @@ func TestTail_BufferTooShort(t *testing.T) {
 	fw.send(ChangeCreated)
 
 	n, err := wait()
-	if !errors.Is(err, ErrBufferTooShort) {
-		t.Fatalf("expected ErrBufferTooShort, got n=%d, err=%v", n, err)
+	if !errors.Is(err, ErrShortBuffer) {
+		t.Fatalf("expected ErrShortBuffer, got n=%d, err=%v", n, err)
 	}
 	if n != 0 {
 		t.Fatalf("expected n=0, got %d", n)
@@ -591,6 +597,713 @@ func TestTail_NamedPipe_NoSeekOff_Fails(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4c: Ported from nxadm/tail — Close behavior, seek-from-middle, large
+//           lines, file rotation, and wait-for-create-then-rename.
+// ---------------------------------------------------------------------------
+
+// TestTail_Close_NeverOpened verifies Close() succeeds on a tail that never
+// opened a file (port of nxadm/tail TestStop).
+func TestTail_Close_NeverOpened(t *testing.T) {
+	fw := newFakeWatcher()
+
+	cfg := Config{
+		Follow:    true,
+		Retry:     true,
+		Delimiter: '\n',
+	}
+	tail := newTailWithWatcher(context.Background(), "/nonexistent/test.log", cfg, fw)
+
+	// Close should succeed without panic.
+	if err := tail.Close(); err != nil {
+		t.Fatalf("Close: unexpected error: %v", err)
+	}
+}
+
+// TestTail_Close_AfterRead verifies Close() succeeds after reading data
+// (port of nxadm/tail TestStopNonEmptyFile).
+func TestTail_Close_AfterRead(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	writeFile(t, path, []byte("hello\nthere\nworld\n"))
+
+	fw := newFakeWatcher()
+
+	cfg := Config{
+		Follow:    false,
+		Delimiter: '\n',
+	}
+	tail := newTailWithWatcher(context.Background(), path, cfg, fw)
+	defer tail.Close()
+
+	buf := make([]byte, 1024)
+
+	// Read the first line, then close.
+	wait := startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+	fw.send(ChangeCreated)
+
+	n, err := wait()
+	if err != nil {
+		t.Fatalf("first line: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "hello" {
+		t.Fatalf("first line: got %q, want %q", string(buf[:n]), "hello")
+	}
+
+	// Close after reading — must not panic.
+	if err := tail.Close(); err != nil {
+		t.Fatalf("Close after read: unexpected error: %v", err)
+	}
+}
+
+// TestTail_Close_WhileBlocked verifies Close() unblocks a ReadLine that is
+// waiting for new data (port of nxadm/tail TestStopAtEOF).
+func TestTail_Close_WhileBlocked(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	writeFile(t, path, []byte("hello\nthere\nworld\n"))
+
+	fw := newFakeWatcher()
+
+	cfg := Config{
+		Follow:    true,
+		Delimiter: '\n',
+	}
+	tailCtx, tailCancel := context.WithCancel(context.Background())
+	defer tailCancel()
+	tail := newTailWithWatcher(tailCtx, path, cfg, fw)
+
+	buf := make([]byte, 1024)
+
+	// Read initial lines.
+	n, err := tail.ReadLine(buf)
+	if err != nil {
+		t.Fatalf("line 1: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "hello" {
+		t.Fatalf("line 1: got %q, want %q", string(buf[:n]), "hello")
+	}
+
+	n, err = tail.ReadLine(buf)
+	if err != nil {
+		t.Fatalf("line 2: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "there" {
+		t.Fatalf("line 2: got %q, want %q", string(buf[:n]), "there")
+	}
+
+	n, err = tail.ReadLine(buf)
+	if err != nil {
+		t.Fatalf("line 3: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "world" {
+		t.Fatalf("line 3: got %q, want %q", string(buf[:n]), "world")
+	}
+
+	// Now ReadLine blocks waiting for more data (stateEOF → BlockUntilChange).
+	wait := startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+
+	// Close while ReadLine is blocked — must unblock with an error.
+	if err := tail.Close(); err != nil {
+		t.Fatalf("Close: unexpected error: %v", err)
+	}
+
+	_, err = wait()
+	if err == nil {
+		t.Fatalf("expected error after Close, got nil")
+	}
+	t.Logf("ReadLine unblocked with: %v", err)
+}
+
+// TestTail_SeekFromMiddle verifies seeking with a negative offset from
+// SeekEnd (port of nxadm/tail TestLocationMiddle).
+func TestTail_SeekFromMiddle(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	// 6 bytes: a\nb\nc\n → seek -4 from end = position 2 → reads "b", "c"
+	writeFile(t, path, []byte("a\nb\nc\n"))
+
+	fw := newFakeWatcher()
+
+	cfg := Config{
+		Seek:      SeekInfo{Offset: -4, Whence: io.SeekEnd},
+		Follow:    true,
+		Delimiter: '\n',
+	}
+	tail := newTailWithWatcher(context.Background(), path, cfg, fw)
+	defer tail.Close()
+
+	buf := make([]byte, 1024)
+
+	// Read lines from middle.
+	wait := startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+	fw.send(ChangeCreated)
+
+	n, err := wait()
+	if err != nil {
+		t.Fatalf("line b: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "b" {
+		t.Fatalf("line b: got %q, want %q", string(buf[:n]), "b")
+	}
+
+	n, err = tail.ReadLine(buf)
+	if err != nil {
+		t.Fatalf("line c: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "c" {
+		t.Fatalf("line c: got %q, want %q", string(buf[:n]), "c")
+	}
+
+	// Now follow: append new data.
+	wait = startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+	appendFile(t, path, []byte("d\n"))
+	fw.send(ChangeModified)
+
+	n, err = wait()
+	if err != nil {
+		t.Fatalf("line d: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "d" {
+		t.Fatalf("line d: got %q, want %q", string(buf[:n]), "d")
+	}
+}
+
+// TestTail_LargeLine verifies that a line approaching the bufio.Reader's
+// default buffer size (4096 bytes) is read correctly when the caller provides
+// an adequate buffer (port of nxadm/tail TestOver4096ByteLine).
+// NOTE: lines larger than 4096 bytes require MaxLineSize splitting or a
+// larger bufio.Reader buffer, neither of which are currently implemented.
+func TestTail_LargeLine(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	// Use 4000 bytes — fits within the default 4096-byte bufio.Reader buffer
+	// even after the first "small\n" line is consumed.
+	largeContent := strings.Repeat("a", 4000)
+	writeFile(t, path, []byte("small\n"+largeContent+"\nlast\n"))
+
+	fw := newFakeWatcher()
+
+	cfg := Config{
+		Follow:    true,
+		Delimiter: '\n',
+	}
+	tail := newTailWithWatcher(context.Background(), path, cfg, fw)
+	defer tail.Close()
+
+	// Buffer large enough for the 4000-byte line.
+	buf := make([]byte, 8192)
+
+	// Read small line.
+	wait := startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+	fw.send(ChangeCreated)
+
+	n, err := wait()
+	if err != nil {
+		t.Fatalf("small line: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "small" {
+		t.Fatalf("small line: got %q, want %q", string(buf[:n]), "small")
+	}
+
+	// Read large line.
+	n, err = tail.ReadLine(buf)
+	if err != nil {
+		t.Fatalf("large line: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != largeContent {
+		t.Fatalf("large line: got %d bytes, want %d bytes", n, len(largeContent))
+	}
+
+	// Read last line.
+	n, err = tail.ReadLine(buf)
+	if err != nil {
+		t.Fatalf("last line: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "last" {
+		t.Fatalf("last line: got %q, want %q", string(buf[:n]), "last")
+	}
+}
+
+// TestTail_RenameThenRecreate verifies that after a file is renamed and a
+// new file is created with the same name, tail picks up the new file's
+// content (port of nxadm/tail reOpen / TestReOpen*).
+func TestTail_RenameThenRecreate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	rotated := filepath.Join(dir, "test.log.rotated")
+	writeFile(t, path, []byte("hello\nworld\n"))
+
+	fw := newFakeWatcher()
+
+	cfg := Config{
+		Follow:    true,
+		Retry:     true,
+		Delimiter: '\n',
+	}
+	tail := newTailWithWatcher(context.Background(), path, cfg, fw)
+	defer tail.Close()
+
+	buf := make([]byte, 1024)
+
+	// Read initial lines.
+	n, err := tail.ReadLine(buf)
+	if err != nil {
+		t.Fatalf("line 1: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "hello" {
+		t.Fatalf("line 1: got %q, want %q", string(buf[:n]), "hello")
+	}
+
+	n, err = tail.ReadLine(buf)
+	if err != nil {
+		t.Fatalf("line 2: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "world" {
+		t.Fatalf("line 2: got %q, want %q", string(buf[:n]), "world")
+	}
+
+	// ReadLine blocks waiting for more data.
+	wait := startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+
+	// Rename the file (simulates log rotation).
+	if err := os.Rename(path, rotated); err != nil {
+		t.Fatalf("os.Rename: %v", err)
+	}
+	fw.send(ChangeDeleted)
+	time.Sleep(50 * time.Millisecond)
+
+	// Create a new file with the same name and new content.
+	writeFile(t, path, []byte("newdata\n"))
+	fw.send(ChangeCreated)
+
+	n, err = wait()
+	if err != nil {
+		t.Fatalf("newdata: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "newdata" {
+		t.Fatalf("newdata: got %q, want %q", string(buf[:n]), "newdata")
+	}
+}
+
+// TestTail_WaitForCreateThenRename verifies the full lifecycle: file doesn't
+// exist → created → read → renamed → recreated → read new content
+// (port of nxadm/tail TestInotify_WaitForCreateThenMove).
+func TestTail_WaitForCreateThenRename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	rotated := filepath.Join(dir, "test.log.rotated")
+	// Ensure file does not exist.
+	os.Remove(path)
+
+	fw := newFakeWatcher()
+
+	cfg := Config{
+		Follow:    true,
+		Retry:     true,
+		Delimiter: '\n',
+	}
+	tail := newTailWithWatcher(context.Background(), path, cfg, fw)
+	defer tail.Close()
+
+	buf := make([]byte, 1024)
+
+	// Start ReadLine — file doesn't exist, blocks in stateNotOpen.
+	wait := startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+
+	// First attempt: file still missing.
+	fw.send(ChangeCreated)
+	time.Sleep(50 * time.Millisecond)
+
+	// Create file and notify.
+	writeFile(t, path, []byte("hello\nworld\n"))
+	fw.send(ChangeCreated)
+
+	n, err := wait()
+	if err != nil {
+		t.Fatalf("hello: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "hello" {
+		t.Fatalf("hello: got %q, want %q", string(buf[:n]), "hello")
+	}
+
+	// Read second line.
+	n, err = tail.ReadLine(buf)
+	if err != nil {
+		t.Fatalf("world: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "world" {
+		t.Fatalf("world: got %q, want %q", string(buf[:n]), "world")
+	}
+
+	// Block waiting for more, then rename.
+	wait = startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+
+	if err := os.Rename(path, rotated); err != nil {
+		t.Fatalf("os.Rename: %v", err)
+	}
+	fw.send(ChangeDeleted)
+	time.Sleep(50 * time.Millisecond)
+
+	// Create new file with same name.
+	writeFile(t, path, []byte("endofworld\n"))
+	fw.send(ChangeCreated)
+
+	n, err = wait()
+	if err != nil {
+		t.Fatalf("endofworld: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "endofworld" {
+		t.Fatalf("endofworld: got %q, want %q", string(buf[:n]), "endofworld")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4d: MaxLineSize chunking and trailing-data fix
+// ---------------------------------------------------------------------------
+
+// TestTail_TrailingData_NoFollow verifies that a file without a trailing
+// newline returns all lines including the last one (the stateEOF fix).
+func TestTail_TrailingData_NoFollow(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	// No trailing newline on last line.
+	writeFile(t, path, []byte("hello\nworld"))
+
+	fw := newFakeWatcher()
+
+	cfg := Config{
+		Follow:    false,
+		Delimiter: '\n',
+	}
+	tail := newTailWithWatcher(context.Background(), path, cfg, fw)
+	defer tail.Close()
+
+	buf := make([]byte, 1024)
+
+	// Read "hello".
+	wait := startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+	fw.send(ChangeCreated)
+
+	n, err := wait()
+	if err != nil {
+		t.Fatalf("hello: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "hello" {
+		t.Fatalf("hello: got %q, want %q", string(buf[:n]), "hello")
+	}
+
+	// Read "world" — the trailing data without newline.
+	n, err = tail.ReadLine(buf)
+	if err != nil {
+		t.Fatalf("world: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "world" {
+		t.Fatalf("world: got %q, want %q", string(buf[:n]), "world")
+	}
+
+	// EOF.
+	n, err = tail.ReadLine(buf)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected io.EOF, got n=%d, err=%v", n, err)
+	}
+	if n != 0 {
+		t.Fatalf("EOF: expected n=0, got %d", n)
+	}
+}
+
+// TestTail_TrailingData_NoFollow_EmptyFile verifies that an empty file
+// returns io.EOF immediately (no phantom empty line).
+func TestTail_TrailingData_NoFollow_EmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	writeFile(t, path, []byte{})
+
+	fw := newFakeWatcher()
+
+	cfg := Config{
+		Follow:    false,
+		Delimiter: '\n',
+	}
+	tail := newTailWithWatcher(context.Background(), path, cfg, fw)
+	defer tail.Close()
+
+	buf := make([]byte, 1024)
+
+	wait := startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+	fw.send(ChangeCreated)
+
+	n, err := wait()
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected io.EOF, got n=%d, err=%v", n, err)
+	}
+	if n != 0 {
+		t.Fatalf("EOF: expected n=0, got %d", n)
+	}
+}
+
+// TestTail_MaxLineSize_Chunking verifies that lines exceeding MaxLineSize
+// are returned in chunks with ErrMaxLineSizeExceeded.
+func TestTail_MaxLineSize_Chunking(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	// 12 a's + newline = 13 bytes. MaxLineSize=5.
+	writeFile(t, path, []byte(strings.Repeat("a", 12)+"\n"))
+
+	fw := newFakeWatcher()
+
+	cfg := Config{
+		Follow:      false,
+		MaxLineSize: 5,
+		Delimiter:   '\n',
+	}
+	tail := newTailWithWatcher(context.Background(), path, cfg, fw)
+	defer tail.Close()
+
+	buf := make([]byte, 1024)
+
+	// Chunk 1: 5 a's + ErrMaxLineSizeExceeded (idx >= MaxLineSize).
+	wait := startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+	fw.send(ChangeCreated)
+
+	n, err := wait()
+	if !errors.Is(err, ErrMaxLineSizeExceeded) {
+		t.Fatalf("chunk 1: expected ErrMaxLineSizeExceeded, got n=%d, err=%v", n, err)
+	}
+	if string(buf[:n]) != "aaaaa" {
+		t.Fatalf("chunk 1: got %q, want %q", string(buf[:n]), "aaaaa")
+	}
+
+	// Chunk 2: 5 a's + ErrMaxLineSizeExceeded.
+	n, err = tail.ReadLine(buf)
+	if !errors.Is(err, ErrMaxLineSizeExceeded) {
+		t.Fatalf("chunk 2: expected ErrMaxLineSizeExceeded, got n=%d, err=%v", n, err)
+	}
+	if string(buf[:n]) != "aaaaa" {
+		t.Fatalf("chunk 2: got %q, want %q", string(buf[:n]), "aaaaa")
+	}
+
+	// Remainder: 2 a's + newline → "aa" + nil.
+	n, err = tail.ReadLine(buf)
+	if err != nil {
+		t.Fatalf("remainder: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "aa" {
+		t.Fatalf("remainder: got %q, want %q", string(buf[:n]), "aa")
+	}
+
+	// EOF.
+	n, err = tail.ReadLine(buf)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected io.EOF, got n=%d, err=%v", n, err)
+	}
+}
+
+// TestTail_MaxLineSize_ShortBuffer verifies ErrShortBuffer takes priority
+// when the caller's buffer is too small for one MaxLineSize chunk.
+func TestTail_MaxLineSize_ShortBuffer(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	writeFile(t, path, []byte(strings.Repeat("a", 10)+"\n"))
+
+	fw := newFakeWatcher()
+
+	cfg := Config{
+		Follow:      false,
+		MaxLineSize: 5,
+		Delimiter:   '\n',
+	}
+	tail := newTailWithWatcher(context.Background(), path, cfg, fw)
+	defer tail.Close()
+
+	// Buffer too small even for one MaxLineSize chunk.
+	buf := make([]byte, 3)
+	wait := startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+	fw.send(ChangeCreated)
+
+	n, err := wait()
+	if !errors.Is(err, ErrShortBuffer) {
+		t.Fatalf("expected ErrShortBuffer, got n=%d, err=%v", n, err)
+	}
+	if n != 0 {
+		t.Fatalf("expected n=0, got %d", n)
+	}
+}
+
+// TestTail_MaxLineSize_TrailingData verifies chunking of the last line
+// when it has no trailing delimiter.
+func TestTail_MaxLineSize_TrailingData(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	// "abcdefgh" — 8 bytes, no delimiter. MaxLineSize=3.
+	writeFile(t, path, []byte("abcdefgh"))
+
+	fw := newFakeWatcher()
+
+	cfg := Config{
+		Follow:      false,
+		MaxLineSize: 3,
+		Delimiter:   '\n',
+	}
+	tail := newTailWithWatcher(context.Background(), path, cfg, fw)
+	defer tail.Close()
+
+	buf := make([]byte, 1024)
+
+	// Chunk 1: "abc" + ErrMaxLineSizeExceeded (idx < 0, n >= MaxLineSize).
+	wait := startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+	fw.send(ChangeCreated)
+
+	n, err := wait()
+	if !errors.Is(err, ErrMaxLineSizeExceeded) {
+		t.Fatalf("chunk 1: expected ErrMaxLineSizeExceeded, got n=%d, err=%v", n, err)
+	}
+	if string(buf[:n]) != "abc" {
+		t.Fatalf("chunk 1: got %q, want %q", string(buf[:n]), "abc")
+	}
+
+	// Chunk 2: "def" + ErrMaxLineSizeExceeded.
+	n, err = tail.ReadLine(buf)
+	if !errors.Is(err, ErrMaxLineSizeExceeded) {
+		t.Fatalf("chunk 2: expected ErrMaxLineSizeExceeded, got n=%d, err=%v", n, err)
+	}
+	if string(buf[:n]) != "def" {
+		t.Fatalf("chunk 2: got %q, want %q", string(buf[:n]), "def")
+	}
+
+	// Remainder: "gh" + nil (probed EOF, returned trailing data).
+	n, err = tail.ReadLine(buf)
+	if err != nil {
+		t.Fatalf("remainder: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "gh" {
+		t.Fatalf("remainder: got %q, want %q", string(buf[:n]), "gh")
+	}
+
+	// EOF.
+	n, err = tail.ReadLine(buf)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected io.EOF, got n=%d, err=%v", n, err)
+	}
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase 4e: Regression tests for stateEOF event handlers with buffered data
+// ---------------------------------------------------------------------------
+
+// TestTail_ChangeDeleted_WithBufferedData verifies that when ChangeDeleted fires
+// while the reader holds buffered trailing data (a partial last line without
+// delimiter), the data is drained and returned before the old file handle
+// is closed.
+func TestTail_ChangeDeleted_WithBufferedData(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	// "hello\nworld" — 11 bytes, no trailing newline on "world".
+	writeFile(t, path, []byte("hello\nworld"))
+
+	fw := newFakeWatcher()
+
+	cfg := Config{
+		Follow:    true,
+		Retry:     false, // don't retry after drain — just verify drain happens
+		Delimiter: '\n',
+	}
+	tail := newTailWithWatcher(context.Background(), path, cfg, fw)
+	defer tail.Close()
+
+	buf := make([]byte, 1024)
+
+	// Read first line.
+	n, err := tail.ReadLine(buf)
+	if err != nil {
+		t.Fatalf("line 1: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "hello" {
+		t.Fatalf("line 1: got %q, want %q", string(buf[:n]), "hello")
+	}
+
+	// ReadLine again — "world" is buffered with no delimiter, blocks at stateEOF.
+	wait := startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+
+	// Simulate file deletion (log rotation). The old file handle closes,
+	// but buffered "world" should be drained and returned first.
+	fw.send(ChangeDeleted)
+
+	n, err = wait()
+	if err != nil {
+		t.Fatalf("trailing data: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "world" {
+		t.Fatalf("trailing data: got %q, want %q", string(buf[:n]), "world")
+	}
+
+	// Next ReadLine: stateNotOpen with Retry=false → error.
+	n, err = tail.ReadLine(buf)
+	if err == nil {
+		t.Fatalf("expected error after drain+close, got n=%d, err=nil", n)
+	}
+	t.Logf("after drain+close: %v", err)
+}
+
+// TestTail_ChangeModified_WithBufferedData verifies that when ChangeModified
+// fires while the reader holds buffered partial data (incomplete line), the
+// probe Peek preserves the existing buffer and merges it with newly appended
+// file content to form a complete line.
+func TestTail_ChangeModified_WithBufferedData(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	// "partial" — 7 bytes, no delimiter.
+	writeFile(t, path, []byte("partial"))
+
+	fw := newFakeWatcher()
+
+	cfg := Config{
+		Follow:    true,
+		Delimiter: '\n',
+	}
+	tail := newTailWithWatcher(context.Background(), path, cfg, fw)
+	defer tail.Close()
+
+	buf := make([]byte, 1024)
+
+	// ReadLine blocks at stateEOF: "partial" buffered, no delimiter found,
+	// n=7 < MaxLineSize=4096 → stateEOF → BlockUntilChange.
+	wait := startReadLine(t, tail, buf)
+	time.Sleep(50 * time.Millisecond)
+
+	// Append "_done\n" to the file, making it "partial_done\n".
+	appendFile(t, path, []byte("_done\n"))
+
+	// Notify that the file was modified.
+	fw.send(ChangeModified)
+
+	// The probe Peek should force bufio.Reader to fill from the file,
+	// merging old buffered "partial" with new "_done\n" → "partial_done".
+	n, err := wait()
+	if err != nil {
+		t.Fatalf("merged line: unexpected error: %v", err)
+	}
+	if string(buf[:n]) != "partial_done" {
+		t.Fatalf("merged line: got %q, want %q", string(buf[:n]), "partial_done")
+	}
+}
+
+
+// ---------------------------------------------------------------------------
 // Phase 5: Shared test suite — runs against both PollWatcher and FSNotifyWatcher
 // ---------------------------------------------------------------------------
 
@@ -715,6 +1428,160 @@ func RunTailTests(t *testing.T, factory TailFactory) {
 		n, err = tail.ReadLine(buf)
 		if !errors.Is(err, io.EOF) {
 			t.Fatalf("expected io.EOF after empty line, got n=%d, err=%v", n, err)
+		}
+	})
+
+	t.Run("seek from middle", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "test.log")
+
+		// File: a\nb\nc\n = 6 bytes. Seek -4 from end = position 2 = "b\nc\n".
+		writeFile(t, path, []byte("a\nb\nc\n"))
+
+		cfg := Config{
+			Seek:      SeekInfo{Offset: -4, Whence: io.SeekEnd},
+			Follow:    false,
+			Delimiter: '\n',
+		}
+		tail := factory(t, context.Background(), path, cfg)
+		defer tail.Close()
+
+		buf := make([]byte, 1024)
+
+		n, err := tail.ReadLine(buf)
+		if err != nil {
+			t.Fatalf("line b: unexpected error: %v", err)
+		}
+		if string(buf[:n]) != "b" {
+			t.Fatalf("line b: got %q, want %q", string(buf[:n]), "b")
+		}
+
+		n, err = tail.ReadLine(buf)
+		if err != nil {
+			t.Fatalf("line c: unexpected error: %v", err)
+		}
+		if string(buf[:n]) != "c" {
+			t.Fatalf("line c: got %q, want %q", string(buf[:n]), "c")
+		}
+
+		n, err = tail.ReadLine(buf)
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("expected io.EOF, got n=%d, err=%v", n, err)
+		}
+	})
+
+	t.Run("file rotation", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "test.log")
+		rotated := filepath.Join(dir, "test.log.rotated")
+
+		writeFile(t, path, []byte("old1\nold2\n"))
+
+		cfg := Config{
+			Follow:    true,
+			Retry:     true,
+			Delimiter: '\n',
+		}
+		tail := factory(t, context.Background(), path, cfg)
+		defer tail.Close()
+
+		buf := make([]byte, 1024)
+
+		// Read initial content.
+		n, err := tail.ReadLine(buf)
+		if err != nil {
+			t.Fatalf("old1: unexpected error: %v", err)
+		}
+		if string(buf[:n]) != "old1" {
+			t.Fatalf("old1: got %q, want %q", string(buf[:n]), "old1")
+		}
+
+		n, err = tail.ReadLine(buf)
+		if err != nil {
+			t.Fatalf("old2: unexpected error: %v", err)
+		}
+		if string(buf[:n]) != "old2" {
+			t.Fatalf("old2: got %q, want %q", string(buf[:n]), "old2")
+		}
+
+		// ReadLine blocks waiting for more data.
+		type result struct {
+			n   int
+			err error
+		}
+		ch := make(chan result, 1)
+		go func() {
+			n, err := tail.ReadLine(buf)
+			ch <- result{n, err}
+		}()
+
+		// Give the watcher time to reach BlockUntilChange.
+		time.Sleep(100 * time.Millisecond)
+
+		// Rename the file (simulates log rotation).
+		if err := os.Rename(path, rotated); err != nil {
+			t.Fatalf("os.Rename: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+
+		// Create a new file with the same name.
+		writeFile(t, path, []byte("new1\nnew2\n"))
+
+		r := <-ch
+		if r.err != nil {
+			t.Fatalf("new1: unexpected error: %v", r.err)
+		}
+		if string(buf[:r.n]) != "new1" {
+			t.Fatalf("new1: got %q, want %q", string(buf[:r.n]), "new1")
+		}
+
+		n, err = tail.ReadLine(buf)
+		if err != nil {
+			t.Fatalf("new2: unexpected error: %v", err)
+		}
+		if string(buf[:n]) != "new2" {
+			t.Fatalf("new2: got %q, want %q", string(buf[:n]), "new2")
+		}
+	})
+
+	t.Run("trailing data, no follow", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "test.log")
+
+		// No trailing newline on last line.
+		writeFile(t, path, []byte("hello\nworld"))
+
+		cfg := Config{
+			Follow:    false,
+			Delimiter: '\n',
+		}
+		tail := factory(t, context.Background(), path, cfg)
+		defer tail.Close()
+
+		buf := make([]byte, 1024)
+
+		n, err := tail.ReadLine(buf)
+		if err != nil {
+			t.Fatalf("hello: unexpected error: %v", err)
+		}
+		if string(buf[:n]) != "hello" {
+			t.Fatalf("hello: got %q, want %q", string(buf[:n]), "hello")
+		}
+
+		n, err = tail.ReadLine(buf)
+		if err != nil {
+			t.Fatalf("world: unexpected error: %v", err)
+		}
+		if string(buf[:n]) != "world" {
+			t.Fatalf("world: got %q, want %q", string(buf[:n]), "world")
+		}
+
+		n, err = tail.ReadLine(buf)
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("expected io.EOF, got n=%d, err=%v", n, err)
+		}
+		if n != 0 {
+			t.Fatalf("EOF: expected n=0, got %d", n)
 		}
 	})
 }

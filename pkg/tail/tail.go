@@ -30,7 +30,7 @@ type Config struct {
 	Follow bool
 
 	// Keep trying to open a file if it is inaccessible.
-	// Ignored when Follow is false.
+	// Requires Follow to be set.
 	Retry bool
 
 	// Use PollWatcher for file changes.
@@ -41,13 +41,19 @@ type Config struct {
 	// Enable this for named pipes (mkfifo).
 	NoSeek bool
 
+	// MaxLineSize sets the maximum line length in bytes.
+	// Lines exceeding this are returned in chunks of MaxLineSize with error ErrMaxLineSizeExceeded.
+	// Defaults to 4096 when <= 0.
+	MaxLineSize int
+
 	// Line delimiter.
 	Delimiter byte
 }
 
 func DefaultConfig() Config {
 	return Config{
-		Delimiter: '\n',
+		Delimiter:   '\n',
+		MaxLineSize: 4096,
 	}
 }
 
@@ -108,11 +114,15 @@ func New(ctx context.Context, filename string, cfg Config) (*Tail, error) {
 func newTailWithWatcher(ctx context.Context, filename string, cfg Config, watcher Watcher) *Tail {
 	ctx, cancel := context.WithCancel(ctx)
 
+	if cfg.MaxLineSize <= 0 {
+		cfg.MaxLineSize = 4096
+	}
+
 	return &Tail{
 		cfg:      cfg,
 		filename: filename,
 		watcher:  watcher,
-		reader:   bufio.NewReader(&fakeReader{}),
+		reader:   bufio.NewReaderSize(&fakeReader{}, cfg.MaxLineSize),
 		state:    stateInit,
 		ctx:      ctx,
 		cancel:   cancel,
@@ -120,8 +130,9 @@ func newTailWithWatcher(ctx context.Context, filename string, cfg Config, watche
 }
 
 var (
-	ErrBufferTooShort = errors.New("buffer is too short to read complete line")
-	ErrClosed         = errors.New("closed")
+	ErrMaxLineSizeExceeded = errors.New("line exceeds MaxLineSize")
+	ErrShortBuffer         = io.ErrShortBuffer
+	ErrClosed              = errors.New("closed")
 )
 
 func (t *Tail) ReadLine(b []byte) (int, error) {
@@ -178,13 +189,38 @@ func (t *Tail) ReadLine(b []byte) (int, error) {
 
 			idx := bytes.IndexByte(peeked, t.cfg.Delimiter)
 			if idx < 0 {
-				// Not a full line
+				// No delimiter found
+				if n >= t.cfg.MaxLineSize {
+					// Line exceeds MaxLineSize
+					// Return chunk
+					n = t.cfg.MaxLineSize
+					if len(b) < n {
+						return 0, ErrShortBuffer
+					}
+					peeked, _ = t.reader.Peek(n)
+					copied := copy(b, peeked[:n])
+					t.reader.Discard(n)
+					return copied, ErrMaxLineSizeExceeded
+				}
 				t.state = stateEOF
 				continue
 			}
 
+			// Delimiter found
+			// Chunk if line exceeds MaxLineSize
+			if idx >= t.cfg.MaxLineSize {
+				n = t.cfg.MaxLineSize
+				if len(b) < n {
+					return 0, ErrShortBuffer
+				}
+				peeked, _ = t.reader.Peek(n)
+				copied := copy(b, peeked[:n])
+				t.reader.Discard(n)
+				return copied, ErrMaxLineSizeExceeded
+			}
+
 			if len(b) < idx {
-				return 0, ErrBufferTooShort
+				return 0, ErrShortBuffer
 			}
 
 			copied := copy(b, peeked[:idx])
@@ -193,6 +229,27 @@ func (t *Tail) ReadLine(b []byte) (int, error) {
 
 		case stateEOF:
 			if !t.cfg.Follow {
+				n := t.reader.Buffered()
+				if n > 0 {
+					// Probe for more data
+					_, peekErr := t.reader.Peek(n + 1)
+					if errors.Is(peekErr, io.EOF) {
+						// True EOF
+						// Return as final line
+						peeked, _ := t.reader.Peek(n)
+						copied := copy(b, peeked[:n])
+						t.reader.Discard(n)
+						return copied, nil
+					}
+					if peekErr != nil {
+						t.failErr = peekErr
+						t.state = stateFailed
+						return 0, peekErr
+					}
+					// Has more
+					t.state = stateReady
+					continue
+				}
 				t.failErr = io.EOF
 				t.state = stateFailed
 				return 0, io.EOF
@@ -206,21 +263,37 @@ func (t *Tail) ReadLine(b []byte) (int, error) {
 			}
 
 			switch ch {
-			case ChangeModified:
+			case ChangeModified, ChangeCreated:
+				// Drain EOF error in bufio.Reader
+				if n := t.reader.Buffered(); n > 0 && n < t.cfg.MaxLineSize {
+					t.reader.Peek(n + 1) // trigger file read
+				}
 				t.state = stateReady
 				continue
 			case ChangeDeleted:
+				// Drain buffer from old file
+				if n := t.reader.Buffered(); n > 0 {
+					if len(b) < n {
+						return 0, ErrShortBuffer
+					}
+					peeked, _ := t.reader.Peek(n)
+					copied := copy(b, peeked[:n])
+					t.reader.Discard(n)
+					t.file.Close()
+					t.file = nil
+					t.state = stateNotOpen
+					return copied, nil
+				}
 				err = t.file.Close()
 				if err != nil {
 					t.failErr = err
 					t.state = stateFailed
 					return 0, err
 				}
+				t.file = nil
 				t.state = stateNotOpen
 				continue
-			case ChangeCreated:
-				t.state = stateReady
-				continue
+
 			case ChangeTruncated:
 				if !t.cfg.NoSeek {
 					_, err := t.file.Seek(0, io.SeekStart)
@@ -249,7 +322,7 @@ func (t *Tail) ReadLine(b []byte) (int, error) {
 			}
 
 			switch ch {
-			case ChangeCreated:
+			case ChangeCreated, ChangeModified, ChangeTruncated:
 				// Try to open file
 				file, err := os.Open(t.filename)
 				if err != nil {
@@ -266,15 +339,6 @@ func (t *Tail) ReadLine(b []byte) (int, error) {
 				t.state = stateFailed
 				return 0, t.failErr
 
-			case ChangeModified:
-				t.failErr = errors.New("got ChangeModified in stateNotOpen")
-				t.state = stateFailed
-				return 0, t.failErr
-
-			case ChangeTruncated:
-				t.failErr = errors.New("got ChangeModified in stateNotOpen")
-				t.state = stateFailed
-				return 0, t.failErr
 			}
 
 		case stateFailed:

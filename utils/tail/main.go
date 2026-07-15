@@ -115,7 +115,7 @@ func staticTail(ctx context.Context, filename string, cfg tail.Config, numLines 
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			if errors.Is(err, tail.ErrBufferTooShort) {
+			if errors.Is(err, tail.ErrShortBuffer) {
 				buf = grow(buf)
 				continue
 			}
@@ -174,7 +174,7 @@ func followWithHead(ctx context.Context, filename string, cfg tail.Config, numLi
 				if errors.Is(err, io.EOF) {
 					break
 				}
-				if errors.Is(err, tail.ErrBufferTooShort) {
+				if errors.Is(err, tail.ErrShortBuffer) {
 					buf = grow(buf)
 					continue
 				}
@@ -214,7 +214,7 @@ func followLoop(ctx context.Context, t *tail.Tail) error {
 				errors.Is(err, tail.ErrClosed) {
 				return nil
 			}
-			if errors.Is(err, tail.ErrBufferTooShort) {
+			if errors.Is(err, tail.ErrShortBuffer) {
 				buf = grow(buf)
 				continue
 			}
