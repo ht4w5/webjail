@@ -45,7 +45,7 @@ func (l *Local) Query(ctx context.Context, url string) (int64, error) {
 	}
 	newPrefix, prefixLen, ok := l.trie.LongestPrefixMatchWithLen(url)
 	if !ok {
-		return noInfo, ErrNoInfo
+		return NoInfo, ErrNoInfo
 	}
 
 	return l.queryFilesystem(newPrefix + url[prefixLen:])
@@ -55,13 +55,13 @@ func (l *Local) queryFilesystem(path string) (int64, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return noInfo, ErrNoInfo
+			return NoInfo, ErrNoInfo
 		}
 		l.logger.Warn().Stack().Err(err).Msg("stat file error")
 		return 0, err
 	}
 	if info.IsDir() {
-		return noInfo, ErrNoInfo
+		return NoInfo, ErrNoInfo
 	}
 	return info.Size(), nil
 }

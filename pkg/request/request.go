@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/HT4w5/webjail/pkg/filesize"
 	"github.com/rs/zerolog"
 )
 
@@ -17,13 +18,15 @@ type Request struct {
 	b          []byte
 	Status     int
 	BodySent   int64
+	Filesize   int64
 	Duration   time.Duration
 	HTTPS      bool
 }
 
 func New(bufferSize int) *Request {
 	return &Request{
-		b: make([]byte, bufferSize),
+		b:        make([]byte, bufferSize),
+		Filesize: filesize.NoInfo,
 	}
 }
 

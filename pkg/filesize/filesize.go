@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	noInfo int64 = -1
+	NoInfo int64 = -1
 )
 
 var (

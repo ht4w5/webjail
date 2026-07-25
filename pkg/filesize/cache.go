@@ -49,7 +49,7 @@ func (c *Cache) Query(ctx context.Context, url string) (size int64, err error) {
 			t := time.Unix(0, int64(binary.LittleEndian.Uint64(val)))
 			if t.After(time.Now()) {
 				size = int64(binary.LittleEndian.Uint64(val[8:]))
-				if size == noInfo {
+				if size == NoInfo {
 					err = ErrNoInfo
 				}
 				return
@@ -62,7 +62,7 @@ func (c *Cache) Query(ctx context.Context, url string) (size int64, err error) {
 	if err != nil {
 		if errors.Is(err, ErrNoInfo) {
 			binary.LittleEndian.PutUint64(buf[:], uint64(time.Now().Add(c.ttl).UnixNano()))
-			size = noInfo
+			size = NoInfo
 			binary.LittleEndian.PutUint64(buf[8:], uint64(size))
 			c.cache.Set(k, buf[:])
 		}
