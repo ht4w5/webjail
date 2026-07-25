@@ -34,6 +34,8 @@ func getBuffer() []byte {
 	return bufPool.Get().([]byte)
 }
 
+var _ Jail = (*BBoltJail)(nil)
+
 type BBoltJail struct {
 	db        *bbolt.DB
 	logger    zerolog.Logger
@@ -206,7 +208,7 @@ func (j *BBoltJail) cleanupLoop(ctx context.Context) {
 
 func (j *BBoltJail) cleanupExpired() {
 	now := time.Now()
-	_ = j.db.Update(func(tx *bbolt.Tx) error {
+	j.db.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(recordsBucket)
 		c := b.Cursor()
 
