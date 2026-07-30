@@ -13,6 +13,10 @@ import (
 	"github.com/rs/zerolog"
 )
 
+const (
+	readBufferSize = 4096
+)
+
 type Ingest interface {
 	Start(ctx context.Context, reqChan chan<- *request.Request) error
 	Shutdown(ctx context.Context) error
@@ -85,9 +89,9 @@ func (mgr *Manager) Start(ctx context.Context, reqChan chan<- *request.Request) 
 		mgr.workers.Go(func() {
 			t := src.transport
 			p := src.parser
+			buf := make([]byte, readBufferSize)
 			for {
 				req := request.Get()
-				buf := req.Bytes()
 				n, err := t.Read(buf)
 				if err != nil {
 					if errors.Is(err, transport.ErrClosed) {

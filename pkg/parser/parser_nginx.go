@@ -51,9 +51,11 @@ func (np *NginxParser) Parse(b []byte, req *request.Request) error {
 		return fmt.Errorf("unmarshal json: %w", err)
 	}
 
-	req.Method = obj.RequestMethod
-	req.Path = obj.URI
-	req.UserAgent = obj.HTTPUserAgent
+	req.Method = method(obj.RequestMethod)
+	req.Path.Reset()
+	req.Path.WriteString(obj.URI)
+	req.UserAgent.Reset()
+	req.UserAgent.WriteString(obj.HTTPUserAgent)
 
 	if obj.HTTPS == "on" {
 		req.HTTPS = true
