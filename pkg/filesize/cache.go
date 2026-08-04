@@ -26,10 +26,10 @@ type Cache struct {
 	ttl time.Duration
 }
 
-func NewCache(upstream Querier, ttl time.Duration, maxBytes int, logger zerolog.Logger) *Cache {
+func NewCache(upstream Querier, ttl time.Duration, size int, logger zerolog.Logger) *Cache {
 	return &Cache{
 		upstream: upstream,
-		cache:    kv.New(maxBytes),
+		cache:    kv.New(size),
 		logger:   logger.With().Str(log.KeyModule, "filesize.Cache").Logger(),
 		ttl:      ttl,
 	}
@@ -43,7 +43,7 @@ func (c *Cache) Query(ctx context.Context, url string) (size int64, err error) {
 
 	var buf [16]byte
 	k := unsafe.Slice(unsafe.StringData(url), len(url))
-	val, ok := c.cache.HasGet(buf[:], k)
+	val, ok := c.cache.HasGet(buf[:0], k)
 	if ok {
 		if len(val) == 16 {
 			t := time.Unix(0, int64(binary.LittleEndian.Uint64(val)))

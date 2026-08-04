@@ -3,7 +3,7 @@ module github.com/HT4w5/webjail
 go 1.26.2
 
 require (
-	github.com/HT4w5/kv v0.1.3
+	github.com/HT4w5/kv v0.2.0
 	github.com/bytedance/sonic v1.15.2
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/rs/zerolog v1.35.1
